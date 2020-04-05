@@ -1,0 +1,371 @@
+#######################################
+# TO DO
+# adjust cluster sg to only allow LB SG
+# 443 on lb to proxy to 80 on ecs
+#######################################
+# This will create:
+# - ECS (Fargate) task definition, cluster, service
+# - ALB, listeners, target group
+# - Security group for ALB, cluster
+# - IAM role/instance profle for cluster
+#######################################
+# Prerequisites:
+# - Route53: definitely need a domain, probably need a hosted zone
+# - ACM: how to handle registering validation records?  Nested?
+#######################################
+# Refs
+# https://www.bogotobogo.com/DevOps/AWS/aws-creating-IAM-Roles-and-associating-them-with-EC2-Instances-in-CloudFormation.php
+#######################################
+# - former2 container runs on 80/tcp
+# - ALB will forward :443 to the container port, and redirect :80 to :443
+#######################################
+
+# Dependencies order:
+# SG -> Target group -> Cluster -> Task def -> Service -> ALB?
+
+AWSTemplateFormatVersion: "2010-09-09"
+Metadata:
+    Generator: "former2"
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: former2
+  TargetVpc:
+    Type: AWS::EC2::VPC::Id
+  TargetSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+  ContainerImage:
+    Type: String
+    Default: packetchef/former2_local
+  ContainerImageTag:
+    Type: String
+    Default: 1.0
+  ContainerPort:
+    Type: Number
+    Default: 80
+  TaskCpu:
+    Type: String
+    Default: "512"
+  TaskMemory:
+    Type: String
+    Default: "1024"
+  # We'll later join the ALB Name and DomainName
+  ALBDomainName:
+    Type: String
+    Default: example.com
+  ALBName:
+    Type: String
+    Default: former-lb
+  HostedZone:
+    Type: String
+    Default: HOSTED_ZONE_ID
+
+Resources:
+#####################################
+# Security group - used by cluster and ALB
+#####################################
+  EC2SecurityGroup:
+      Type: "AWS::EC2::SecurityGroup"
+      Properties:
+          GroupDescription: "load-balancer-wizard-1 created on 2020-04-02T20:14:13.653-04:00"
+          GroupName: !Sub "${ECSCluster}-lb-sg"
+          VpcId: !Ref TargetVpc
+          SecurityGroupIngress: 
+            - 
+              CidrIp: "0.0.0.0/0"
+              FromPort: 80
+              IpProtocol: "tcp"
+              ToPort: 80
+            - 
+              CidrIpv6: "::/0"
+              FromPort: 80
+              IpProtocol: "tcp"
+              ToPort: 80
+            - 
+              CidrIp: "0.0.0.0/0"
+              FromPort: 443
+              IpProtocol: "tcp"
+              ToPort: 443
+            - 
+              CidrIpv6: "::/0"
+              FromPort: 443
+              IpProtocol: "tcp"
+              ToPort: 443
+          SecurityGroupEgress: 
+            - 
+              CidrIp: "0.0.0.0/0"
+              IpProtocol: "-1"
+
+#####################################
+# IAM components
+# - policy, IAM role, instance profile
+# - is there a service role?
+#####################################
+  ClusterTaskIAMRole:
+      Type: "AWS::IAM::Role"
+      Properties:
+          Path: "/"
+          RoleName: !Join ["", [ !Ref ClusterName, -read-only" ] ]
+          AssumeRolePolicyDocument: !Sub "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":[\"ecs-tasks.amazonaws.com\",\"ec2.amazonaws.com\"]},\"Action\":\"sts:AssumeRole\"},{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::${AWS::AccountId}:root\"},\"Action\":\"sts:AssumeRole\"}]}"
+          MaxSessionDuration: 3600
+          ManagedPolicyArns: 
+            - "arn:aws:iam::aws:policy/ReadOnlyAccess"
+  ClusterIAMInstanceProfile:
+      Type: "AWS::IAM::InstanceProfile"
+      Properties:
+          Path: "/"
+          InstanceProfileName: !Ref ClusterTaskIAMRole
+          Roles: 
+            - !Ref ClusterTaskIAMRole
+
+#####################################
+# ECS components
+# - task definition, cluster, service
+#####################################
+  ECSCluster:
+      Type: "AWS::ECS::Cluster"
+      Properties:
+          ClusterName: !Ref ClusterName
+          ClusterSettings: 
+            - 
+              Name: "containerInsights"
+              Value: "enabled"
+  ECSTaskDefinition:
+      Type: "AWS::ECS::TaskDefinition"
+      Properties:
+          ContainerDefinitions: 
+            - 
+              Essential: true
+              Image: !Join [ ":", [ !Ref ContainerImage, !Ref ContainerImageTag ] ]
+              Name: "former2"
+              PortMappings: 
+                - 
+                  ContainerPort: !Ref ContainerPort
+                  HostPort: !Ref ContainerPort
+                  Protocol: "tcp"
+          Family: "former2"
+          TaskRoleArn: !Join ["", [ !Sub "arn:aws:iam::${AWS::AccountId}:role/", !Ref ClusterTaskIAMRole ] ]
+          ExecutionRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/ecsTaskExecutionRole"
+          NetworkMode: "awsvpc"
+          RequiresCompatibilities: 
+            - "FARGATE"
+          Cpu: !Ref TaskCpu
+          Memory: !Ref TaskMemory
+  ECSService:
+      Type: "AWS::ECS::Service"
+      Properties:
+          ServiceName: "former2svc"
+          Cluster: !Ref ECSCluster
+          LoadBalancers: 
+            - 
+              TargetGroupArn: !Sub "arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:targetgroup/ecs-former-formersvc/1dc05259c1d8421a"
+              ContainerName: !Ref ContainerName
+              ContainerPort: !Ref ContainerPort
+          DesiredCount: 1
+          LaunchType: "FARGATE"
+          PlatformVersion: "LATEST"
+          TaskDefinition: !Ref ECSTaskDefinition
+          DeploymentConfiguration: 
+              MaximumPercent: 200
+              MinimumHealthyPercent: 100
+          Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.amazonaws.com/AWSServiceRoleForECS"
+          NetworkConfiguration: 
+              AwsvpcConfiguration: 
+                  AssignPublicIp: "ENABLED"
+                  SecurityGroups: 
+                    - "sg-002878b805d1d83f6"
+                  Subnets: 
+                    - "subnet-08518a9c5ea41e68e"
+                    - "subnet-0db467662734461f7"
+          HealthCheckGracePeriodSeconds: 0
+          SchedulingStrategy: "REPLICA"
+
+
+
+
+
+
+#####################################
+# Networking components
+# - r53 record set for ALB, r53 recordset
+# for ACM request, ACM cert, ALB configs
+#####################################
+  ElasticLoadBalancingV2TargetGroup:
+      Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+      Properties:
+          HealthCheckIntervalSeconds: 30
+          HealthCheckPath: !Sub "/${ECSService.Name}"
+          Port: 80
+          Protocol: "HTTP"
+          HealthCheckPort: "traffic-port"
+          HealthCheckProtocol: "HTTP"
+          HealthCheckTimeoutSeconds: 5
+          UnhealthyThresholdCount: 2
+          TargetType: "ip"
+          Matcher: 
+              HttpCode: "200"
+          HealthyThresholdCount: 5
+          VpcId: !TargatVpc
+          Name: !Sub "ecs-${ECSCluster}-${ECSService.Name}"
+          HealthCheckEnabled: true
+          TargetGroupAttributes: 
+            - 
+              Key: "stickiness.enabled"
+              Value: "false"
+            - 
+              Key: "deregistration_delay.timeout_seconds"
+              Value: "300"
+            - 
+              Key: "stickiness.type"
+              Value: "lb_cookie"
+            - 
+              Key: "stickiness.lb_cookie.duration_seconds"
+              Value: "86400"
+            - 
+              Key: "slow_start.duration_seconds"
+              Value: "0"
+            - 
+              Key: "load_balancing.algorithm.type"
+              Value: "round_robin"
+          # How do we specify targets before the cluster service is started?
+          # How do we map subnet parameter to AZs?
+          Targets: 
+            - 
+              Id: "172.30.5.253"
+              Port: 80
+              AvailabilityZone: !Sub "${AWS::Region}f"
+            - 
+              Id: "172.30.5.51"
+              Port: 80
+              AvailabilityZone: !Sub "${AWS::Region}f"
+            - 
+              Id: "172.30.5.150"
+              Port: 80
+              AvailabilityZone: !Sub "${AWS::Region}f"
+
+
+  ElasticLoadBalancingV2LoadBalancer:
+      Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+      Properties:
+          Name: !Sub "${ECSCluster}-lb"
+          Scheme: "internet-facing"
+          Type: "application"
+          Subnets: 
+            - "subnet-08518a9c5ea41e68e"
+            - "subnet-0db467662734461f7"
+          SecurityGroups: 
+            - "sg-0de5511fd1e14e6bd"
+          IpAddressType: "ipv4"
+          LoadBalancerAttributes: 
+            - 
+              Key: "access_logs.s3.enabled"
+              Value: "false"
+            - 
+              Key: "idle_timeout.timeout_seconds"
+              Value: "60"
+            - 
+              Key: "deletion_protection.enabled"
+              Value: "false"
+            - 
+              Key: "routing.http2.enabled"
+              Value: "true"
+            - 
+              Key: "routing.http.drop_invalid_header_fields.enabled"
+              Value: "false"
+
+  ElasticLoadBalancingV2Listener:
+      Type: "AWS::ElasticLoadBalancingV2::Listener"
+      Properties:
+          LoadBalancerArn: !Sub "arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:loadbalancer/app/${ECSCluster}-lb/1ba12ec1d397f53d"
+          Port: 443
+          Protocol: "HTTPS"
+          SslPolicy: "ELBSecurityPolicy-2016-08"
+          Certificates: 
+            - 
+              CertificateArn: !Sub "arn:aws:acm:${AWS::Region}:${AWS::AccountId}:certificate/18ccc2fd-5923-4bf3-bedb-a12fb886920b"
+          DefaultActions: 
+            - 
+              Order: 1
+              TargetGroupArn: !Sub "arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:targetgroup/ecs-${ECSCluster}-${ECSService.Name}/1dc05259c1d8421a"
+              Type: "forward"
+
+  ElasticLoadBalancingV2Listener2:
+      Type: "AWS::ElasticLoadBalancingV2::Listener"
+      Properties:
+          LoadBalancerArn: !Sub "arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:loadbalancer/app/${ECSCluster}-lb/1ba12ec1d397f53d"
+          Port: 80
+          Protocol: "HTTP"
+          DefaultActions: 
+            - 
+              Order: 1
+              RedirectConfig: 
+                  Protocol: "HTTPS"
+                  Port: "443"
+                  Host: "#{host}"
+                  Path: "/#{path}"
+                  Query: "#{query}"
+                  StatusCode: "HTTP_301"
+              Type: "redirect"
+
+
+
+
+  CertificateManagerCertificate:
+      Type: "AWS::CertificateManager::Certificate"
+      Properties:
+          DomainName: !Sub "${ECSCluster}.slashcomdot.net"
+          SubjectAlternativeNames: 
+            - !Sub "${ECSCluster}.slashcomdot.net"
+            - !Sub "${ECSCluster}-lb.slashcomdot.net"
+          DomainValidationOptions: 
+            - 
+              DomainName: !Sub "${ECSCluster}.slashcomdot.net"
+              ValidationDomain: !Sub "${ECSCluster}.slashcomdot.net"
+            - 
+              DomainName: !Sub "${ECSCluster}-lb.slashcomdot.net"
+              ValidationDomain: !Sub "${ECSCluster}-lb.slashcomdot.net"
+
+  Route53RecordSet:
+      Type: "AWS::Route53::RecordSet"
+      Properties:
+          Name: !Sub "_0313a40edc5a08cacb990543a2de045d.${ECSCluster}-lb.slashcomdot.net."
+          Type: "CNAME"
+          TTL: 300
+          ResourceRecords: 
+            - "_d155a7d076b4e20f3d7ee1bbe0ff31a0.nhqijqilxf.acm-validations.aws."
+          HostedZoneId: "ZKAUIDIVU6EXQ"
+
+  Route53RecordSet2:
+      Type: "AWS::Route53::RecordSet"
+      Properties:
+          Name: !Sub "${ECSCluster}.slashcomdot.net."
+          Type: "A"
+          AliasTarget: 
+              HostedZoneId: !GetAtt ElasticLoadBalancingV2LoadBalancer.CanonicalHostedZoneID
+              DNSName: !Sub "dualstack.${ECSCluster}-lb-1544939340.${AWS::Region}.elb.amazonaws.com."
+              EvaluateTargetHealth: false
+          HostedZoneId: "ZKAUIDIVU6EXQ"
+
+  Route53RecordSet3:
+      Type: "AWS::Route53::RecordSet"
+      Properties:
+          Name: !Sub "_0fccc96b42bced81769d59555da23bb6.${ECSCluster}.slashcomdot.net."
+          Type: "CNAME"
+          TTL: 300
+          ResourceRecords: 
+            - "_720e62a7abb1fc33420aeda8cd8d13c9.nhqijqilxf.acm-validations.aws."
+          HostedZoneId: "ZKAUIDIVU6EXQ"
+
+  Route53HostedZone:
+      Type: "AWS::Route53::HostedZone"
+      Properties:
+          Name: "slashcomdot.net."
+          HostedZoneConfig: 
+              Comment: "Transferred reg 2016-09-06"
+
+
+
+
+
+
